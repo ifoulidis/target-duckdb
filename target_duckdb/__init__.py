@@ -4,6 +4,7 @@ import argparse
 import copy
 import io
 import json
+import shutil
 import sys
 import tempfile
 from datetime import datetime
@@ -12,7 +13,7 @@ from decimal import Decimal
 import duckdb
 from jsonschema import Draft7Validator, FormatChecker
 
-from target_duckdb.db_sync import DbSync
+from target_duckdb.db_sync import DbSync, is_quack_path
 from target_duckdb.logger import get_logger
 
 LOGGER = get_logger("target_duckdb")
@@ -115,13 +116,42 @@ def duckdb_connect(config):
         sys.exit(1)
 
     path = config.get("path", config.get("filepath"))
-    token = config.get("token", None)
-    if token:
-        path = f"{path}?token={token}"
-    db = duckdb.connect(path)
+    token_key = "motherduck_token" if path.startswith("md:") else "token"
+    token = config.get(token_key, None)
+
+    if is_quack_path(path):
+        db = quack_connect(config, path, token)
+    elif path.startswith(("md:", "motherduck:")):
+        token = config.get("motherduck_token")
+        db = duckdb.connect(f"{path}?motherduck_token={token}" if token else path)
+    else:
+        db = duckdb.connect(path)
     settings = config.get("settings", {})
     for setting, value in settings.items():
         db.execute(f"SET {setting} = '{value}'")
+    return db
+
+
+def quack_connect(config, path, token):
+    """Connect straight to a remote DuckDB server over the Quack protocol (e.g. path = 'quack:localhost')"""
+    # Connecting only reads a Quack token from a persistent secret, so store it in a throwaway directory
+    secret_dir = tempfile.mkdtemp()
+    try:
+        setup = duckdb.connect(config={"secret_directory": secret_dir})
+        setup.execute("INSTALL quack")
+        setup.execute("LOAD quack")
+        if token:
+            escaped_token = token.replace("'", "''")
+            setup.execute(
+                f"CREATE PERSISTENT SECRET (TYPE quack, TOKEN '{escaped_token}')"
+            )
+        setup.close()
+        db = duckdb.connect(path, config={"secret_directory": secret_dir})
+    finally:
+        shutil.rmtree(secret_dir)
+    # Tables are addressed by the server's own catalog name
+    if not config.get("database"):
+        config["database"] = db.execute("SELECT current_database()").fetchone()[0]
     return db
 
 
@@ -197,9 +227,9 @@ def persist_lines(connection, config, lines) -> None:
 
             # append record
             if config.get("add_metadata_columns") or config.get("hard_delete"):
-                records_to_load[stream][
-                    primary_key_string
-                ] = add_metadata_values_to_record(o)
+                records_to_load[stream][primary_key_string] = (
+                    add_metadata_values_to_record(o)
+                )
             else:
                 records_to_load[stream][primary_key_string] = o["record"]
 

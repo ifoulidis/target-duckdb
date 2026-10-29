@@ -11,6 +11,10 @@ from urllib.parse import urlparse
 from target_duckdb.logger import get_logger
 
 
+def is_quack_path(path):
+    return path.startswith("quack:")
+
+
 # copied from inflection.camelize to eliminate a dependency
 def camelize(string: str, uppercase_first_letter: bool = True) -> str:
     if uppercase_first_letter:
@@ -227,6 +231,9 @@ class DbSync:
         self.conn = connection
         self.connection_config = connection_config
         self.stream_schema_message = stream_schema_message
+        self.is_quack = is_quack_path(
+            connection_config.get("path", connection_config.get("filepath"))
+        )
 
         # logger to be used across the class's methods
         self.logger = get_logger("target_duckdb")
@@ -329,7 +336,9 @@ class DbSync:
         if without_schema:
             return f'"{pg_table_name.lower()}"'
         elif self.catalog_name:
-            return f'"{self.catalog_name}"."{self.schema_name}"."{pg_table_name.lower()}"'
+            return (
+                f'"{self.catalog_name}"."{self.schema_name}"."{pg_table_name.lower()}"'
+            )
         else:
             return f'"{self.schema_name}"."{pg_table_name.lower()}"'
 
@@ -386,12 +395,24 @@ class DbSync:
             )
             for record in records:
                 csvwriter.writerow(self.record_to_flattened(record))
-        cur.execute("COPY {} FROM '{}' WITH (HEADER false, new_line '\\r\\n')".format(temp_table, temp_file_csv))
+        cur.execute(
+            "COPY {} FROM '{}' WITH (HEADER false, new_line '\\r\\n')".format(
+                temp_table, temp_file_csv
+            )
+        )
+
+        if self.is_quack:
+            # Merging from a client-side table isn't supported over Quack, so push the rows to a staging table on the server first
+            source_table = f'"{self.catalog_name}"."main"."{temp_table}"'
+            cur.execute(f"CREATE TABLE {source_table} AS SELECT * FROM {temp_table}")
+            cur.execute(f"DROP TABLE {temp_table}")
+        else:
+            source_table = temp_table
 
         if len(self.stream_schema_message["key_properties"]) > 0:
-            cur.execute(self.update_from_temp_table(temp_table))
-        cur.execute(self.insert_from_temp_table(temp_table))
-        cur.execute(f"DROP TABLE {temp_table}")
+            cur.execute(self.update_from_temp_table(source_table))
+        cur.execute(self.insert_from_temp_table(source_table))
+        cur.execute(f"DROP TABLE {source_table}")
         os.unlink(temp_file_csv)
 
     # pylint: disable=duplicate-string-formatting-argument
@@ -403,9 +424,7 @@ class DbSync:
         if len(stream_schema_message["key_properties"]) == 0:
             return """INSERT INTO {} ({})
                     (SELECT s.* FROM {} s)
-                    """.format(
-                table, ", ".join(columns), temp_table
-            )
+                    """.format(table, ", ".join(columns), temp_table)
 
         return """INSERT INTO {} ({})
         (SELECT s.* FROM {} s LEFT OUTER JOIN {} t ON {} WHERE {})
@@ -474,7 +493,10 @@ class DbSync:
                 stream_schema_message["stream"], is_temporary=is_temporary
             )
 
-        return "CREATE TABLE IF NOT EXISTS {} ({})".format(
+        # Over Quack a TEMP table stays client-side, so COPY can read our local CSV into it
+        temp = "TEMP " if is_temporary and self.is_quack else ""
+        return "CREATE {}TABLE IF NOT EXISTS {} ({})".format(
+            temp,
             table_name if table_name else gen_table_name,
             ", ".join(columns + primary_key),
         )
